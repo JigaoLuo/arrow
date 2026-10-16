@@ -40,7 +40,7 @@ from pyarrow._parquet import (ParquetReader, Statistics,  # noqa
                               FileMetaData, RowGroupMetaData,
                               ColumnChunkMetaData,
                               ParquetSchema, ColumnSchema,
-                              ParquetLogicalType,
+                              ParquetLogicalType, ParquetPage,
                               FileEncryptionProperties,
                               FileDecryptionProperties,
                               SortingColumn)
@@ -685,6 +685,52 @@ class ParquetFile:
         column_indices = self._get_column_indices(columns)
         return self.reader.scan_contents(column_indices,
                                          batch_size=batch_size)
+
+    def iter_pages(self, row_group, column):
+        """
+        Iterate over the pages of a single column chunk.
+
+        This low-level method gives access to the individual pages
+        (dictionary page and data pages) of a column chunk as they are
+        stored in the file, without decoding them into Arrow data. Each page
+        is decompressed, but its values are left in their Parquet encoding.
+
+        Parameters
+        ----------
+        row_group : int
+            Index of the row group.
+        column : int
+            Index of the leaf (physical) column within the row group, as
+            used by :meth:`RowGroupMetaData.column` and
+            :meth:`ParquetSchema.column`. Each primitive field of a nested
+            type is a separate leaf column, so this is not necessarily the
+            index of a top-level field in :attr:`schema_arrow`.
+
+        Returns
+        -------
+        iterator of ParquetPage
+            The pages of the column chunk, in file order. Each page is
+            self-contained and stays valid after the iterator is exhausted
+            or the file is closed.
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> table = pa.table({'n_legs': [2, 2, 4, 4, 5, 100],
+        ...                   'animal': ["Flamingo", "Parrot", "Dog", "Horse",
+        ...                              "Brittle stars", "Centipede"]})
+        >>> import pyarrow.parquet as pq
+        >>> pq.write_table(table, 'example.parquet')
+        >>> parquet_file = pq.ParquetFile('example.parquet')
+
+        Inspect the pages of the first column of the first row group:
+
+        >>> for page in parquet_file.iter_pages(row_group=0, column=0):
+        ...     print(page.page_type, page.encoding, page.num_values)
+        DICTIONARY_PAGE PLAIN 4
+        DATA_PAGE RLE_DICTIONARY 6
+        """
+        return self.reader.iter_pages(row_group, column)
 
     def _get_column_indices(self, column_names, use_pandas_metadata=False):
         if column_names is None:
@@ -2513,6 +2559,7 @@ __all__ = (
     "ParquetDataset",
     "ParquetFile",
     "ParquetLogicalType",
+    "ParquetPage",
     "ParquetReader",
     "ParquetSchema",
     "ParquetWriter",

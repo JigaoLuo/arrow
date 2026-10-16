@@ -132,6 +132,12 @@ cdef extern from "parquet/api/schema.h" namespace "parquet" nogil:
         ParquetEncoding_BYTE_STREAM_SPLIT \
             " parquet::Encoding::BYTE_STREAM_SPLIT"
 
+    enum ParquetPageType" parquet::PageType::type":
+        ParquetPageType_DATA_PAGE" parquet::PageType::DATA_PAGE"
+        ParquetPageType_INDEX_PAGE" parquet::PageType::INDEX_PAGE"
+        ParquetPageType_DICTIONARY_PAGE" parquet::PageType::DICTIONARY_PAGE"
+        ParquetPageType_DATA_PAGE_V2" parquet::PageType::DATA_PAGE_V2"
+
     enum ParquetCompression" parquet::Compression::type":
         ParquetCompression_UNCOMPRESSED" parquet::Compression::UNCOMPRESSED"
         ParquetCompression_SNAPPY" parquet::Compression::SNAPPY"
@@ -199,6 +205,7 @@ cdef extern from "parquet/api/schema.h" namespace "parquet" nogil:
         int type_length()
         int type_precision()
         int type_scale()
+        ParquetSortOrder sort_order() const
 
     cdef cppclass SchemaDescriptor:
         const ColumnDescriptor* Column(int i)
@@ -275,9 +282,6 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
     cdef cppclass ByteArrayReader(ColumnReader):
         pass
 
-    cdef cppclass RowGroupReader:
-        pass
-
     cdef cppclass CEncodedStatistics" parquet::EncodedStatistics":
         const c_string& max() const
         const c_string& min() const
@@ -287,6 +291,7 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         bint has_max
         bint has_null_count
         bint has_distinct_count
+        bint is_set() const
 
     cdef cppclass ParquetByteArray" parquet::ByteArray":
         uint32_t len
@@ -310,6 +315,12 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         void SetComparator()
         ParquetType physical_type() const
         const ColumnDescriptor* descr() const
+
+        @staticmethod
+        shared_ptr[CStatistics] Make(
+            const ColumnDescriptor* descr,
+            const CEncodedStatistics* encoded_statistics,
+            int64_t num_values, CMemoryPool* pool) except +
 
     cdef cppclass CBoolStatistics" parquet::BoolStatistics"(CStatistics):
         c_bool min()
@@ -391,6 +402,11 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         vector[CSortingColumn] sorting_columns() const
         unique_ptr[CColumnChunkMetaData] ColumnChunk(int i) const
 
+    cdef cppclass CApplicationVersion" parquet::ApplicationVersion":
+        c_bool HasCorrectStatistics(ParquetType primitive,
+                                    const CEncodedStatistics& statistics,
+                                    ParquetSortOrder sort_order) const
+
     cdef cppclass CFileMetaData" parquet::FileMetaData":
         c_bool Equals(const CFileMetaData&) const
         uint32_t size()
@@ -399,6 +415,7 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
         int num_row_groups()
         ParquetVersion version()
         const c_string created_by()
+        const CApplicationVersion& writer_version() const
         int num_schema_elements()
 
         void set_file_path(const c_string& path)
@@ -468,8 +485,46 @@ cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
 
     ArrowReaderProperties default_arrow_reader_properties()
 
+
+cdef extern from "parquet/column_page.h" namespace "parquet" nogil:
+    cdef cppclass CPage" parquet::Page":
+        ParquetPageType type() const
+        shared_ptr[CBuffer] buffer() const
+        int32_t size() const
+
+    cdef cppclass CDataPage" parquet::DataPage"(CPage):
+        int32_t num_values() const
+        ParquetEncoding encoding() const
+        int64_t uncompressed_size() const
+        const CEncodedStatistics& statistics() const
+
+    cdef cppclass CDataPageV1" parquet::DataPageV1"(CDataPage):
+        ParquetEncoding repetition_level_encoding() const
+        ParquetEncoding definition_level_encoding() const
+
+    cdef cppclass CDataPageV2" parquet::DataPageV2"(CDataPage):
+        int32_t num_nulls() const
+        int32_t num_rows() const
+        int32_t definition_levels_byte_length() const
+        int32_t repetition_levels_byte_length() const
+        c_bool is_compressed() const
+
+    cdef cppclass CDictionaryPage" parquet::DictionaryPage"(CPage):
+        int32_t num_values() const
+        ParquetEncoding encoding() const
+        c_bool is_sorted() const
+
+
+cdef extern from "parquet/api/reader.h" namespace "parquet" nogil:
+    cdef cppclass CPageReader" parquet::PageReader":
+        shared_ptr[CPage] NextPage() except +
+
+    cdef cppclass CRowGroupReader" parquet::RowGroupReader":
+        unique_ptr[CPageReader] GetColumnPageReader(int i) except +
+
     cdef cppclass ParquetFileReader:
         shared_ptr[CFileMetaData] metadata()
+        shared_ptr[CRowGroupReader] RowGroup(int i) except +
 
 
 cdef extern from "parquet/api/writer.h" namespace "parquet" nogil:
@@ -568,7 +623,7 @@ cdef extern from "parquet/arrow/reader.h" namespace "parquet::arrow" nogil:
         CStatus ScanContents(vector[int] columns, int32_t column_batch_size,
                              int64_t* num_rows)
 
-        const ParquetFileReader* parquet_reader()
+        ParquetFileReader* parquet_reader()
 
         void set_use_threads(c_bool use_threads)
 
