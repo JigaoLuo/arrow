@@ -105,6 +105,7 @@ Parquet Metadata
    ParquetSchema
    ColumnSchema
    ParquetLogicalType
+   ParquetPage
 
 Encrypted Parquet Files
 ~~~~~~~~~~~~~~~~~~~~~~~

@@ -414,6 +414,8 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         shared_ptr[CDevice] device()
         const shared_ptr[CMemoryManager] memory_manager()
         CDeviceAllocationType device_type()
+        CResult[shared_ptr[CBuffer]] CopySlice(
+            const int64_t start, const int64_t nbytes, CMemoryPool* pool) const
 
     CResult[shared_ptr[CBuffer]] SliceBufferSafe(
         const shared_ptr[CBuffer]& buffer, int64_t offset)

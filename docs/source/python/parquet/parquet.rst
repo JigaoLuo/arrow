@@ -260,6 +260,23 @@ The ``batch_size`` parameter controls the maximum number of rows per
 batch. The ``row_groups`` and ``columns`` parameters allow limiting
 which row groups and columns are read.
 
+At the lowest level, :meth:`~.ParquetFile.iter_pages` gives access to the
+individual pages of a single column chunk, without decoding them into Arrow
+data. Each :class:`~.ParquetPage` exposes the page header fields (type,
+encoding, number of values, statistics) and the decompressed but still
+encoded page body as a :class:`~pyarrow.Buffer`. This is useful to inspect
+how a file is laid out, or to read a small part of a column chunk without
+decoding the whole row group. ``column`` is the index of a leaf column, as
+used by :meth:`~.RowGroupMetaData.column`:
+
+.. code-block:: python
+
+   >>> parquet_file = pq.ParquetFile('example.parquet')
+   >>> for page in parquet_file.iter_pages(row_group=0, column=0):
+   ...     print(page.page_type, page.encoding, page.num_values)
+   DICTIONARY_PAGE PLAIN 2
+   DATA_PAGE RLE_DICTIONARY 3
+
 .. _inspecting_parquet_file_metadata:
 
 Inspecting the Parquet File Metadata

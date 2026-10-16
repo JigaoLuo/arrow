@@ -121,10 +121,12 @@ cdef class ColumnChunkMetaData(_Weakrefable):
 cdef class Statistics(_Weakrefable):
     cdef:
         shared_ptr[CStatistics] statistics
-        ColumnChunkMetaData parent
+        # Keeps alive the owner of the encoded min/max values that
+        # `statistics` references (a ColumnChunkMetaData or a ParquetPage)
+        object parent
 
     cdef inline init(self, const shared_ptr[CStatistics]& statistics,
-                     ColumnChunkMetaData parent):
+                     object parent):
         self.statistics = statistics
         self.parent = parent
 
@@ -137,6 +139,36 @@ cdef class GeoStatistics(_Weakrefable):
                      ColumnChunkMetaData parent):
         self.statistics = statistics
         self.parent = parent
+
+cdef class ParquetPage(_Weakrefable):
+    # A self-contained copy of a page read by parquet::PageReader: the
+    # header fields are extracted eagerly and the page body is copied,
+    # because the C++ reader reuses its buffers between pages.
+    cdef:
+        ParquetPageType _type
+        ParquetEncoding _encoding
+        int32_t _num_values
+        shared_ptr[CBuffer] _buffer
+        CMemoryPool* _pool
+        # DATA_PAGE and DATA_PAGE_V2: copy of the page header statistics
+        # (NULL if absent or not reliable), the Statistics lazily decoded
+        # from them, and what is needed to decode them
+        shared_ptr[CEncodedStatistics] _encoded_statistics
+        shared_ptr[CStatistics] _statistics
+        const ColumnDescriptor* _descr
+        FileMetaData _file_metadata
+        int64_t _uncompressed_size
+        # DATA_PAGE only
+        ParquetEncoding _definition_level_encoding
+        ParquetEncoding _repetition_level_encoding
+        # DATA_PAGE_V2 only
+        int32_t _num_nulls
+        int32_t _num_rows
+        int32_t _definition_levels_byte_length
+        int32_t _repetition_levels_byte_length
+        c_bool _is_compressed
+        # DICTIONARY_PAGE only
+        c_bool _is_sorted
 
 cdef class FileDecryptionProperties:
     """File-level decryption properties for the low-level API"""

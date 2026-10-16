@@ -37,6 +37,7 @@ from pyarrow.lib cimport (_Weakrefable, Buffer, Schema,
                           pyarrow_unwrap_schema,
                           pyarrow_wrap_table,
                           pyarrow_wrap_batch,
+                          pyarrow_wrap_buffer,
                           pyarrow_wrap_scalar,
                           NativeFile, get_reader, get_writer,
                           string_to_timeunit)
@@ -62,7 +63,7 @@ cdef Type _unwrap_list_type(obj) except *:
 
 
 cdef class Statistics(_Weakrefable):
-    """Statistics for a single column in a single row group."""
+    """Statistics of a column chunk or of a data page."""
 
     def __init__(self):
         raise TypeError(f"Do not call {self.__class__.__name__}'s constructor directly")
@@ -184,7 +185,7 @@ cdef class Statistics(_Weakrefable):
 
     @property
     def null_count(self):
-        """Number of null values in chunk (int)."""
+        """Number of null values in the chunk or page (int)."""
         if self.has_null_count:
             return self.statistics.get().null_count()
         else:
@@ -192,7 +193,7 @@ cdef class Statistics(_Weakrefable):
 
     @property
     def distinct_count(self):
-        """Distinct number of values in chunk (int)."""
+        """Distinct number of values in the chunk or page (int)."""
         if self.has_distinct_count:
             return self.statistics.get().distinct_count()
         else:
@@ -1532,6 +1533,15 @@ cdef encoding_enum_from_name(str encoding_name):
         return enc
 
 
+cdef page_type_name_from_enum(ParquetPageType page_type_):
+    return {
+        ParquetPageType_DATA_PAGE: 'DATA_PAGE',
+        ParquetPageType_INDEX_PAGE: 'INDEX_PAGE',
+        ParquetPageType_DICTIONARY_PAGE: 'DICTIONARY_PAGE',
+        ParquetPageType_DATA_PAGE_V2: 'DATA_PAGE_V2',
+    }.get(page_type_, 'UNKNOWN')
+
+
 cdef compression_name_from_enum(ParquetCompression compression_):
     return {
         ParquetCompression_UNCOMPRESSED: 'UNCOMPRESSED',
@@ -1567,6 +1577,232 @@ cdef ParquetCompression compression_from_name(name):
         return ParquetCompression_ZSTD
     else:
         return ParquetCompression_UNCOMPRESSED
+
+
+cdef class ParquetPage(_Weakrefable):
+    """
+    A single page of a Parquet column chunk.
+
+    Pages are produced by :meth:`ParquetFile.iter_pages`. The page body
+    (:attr:`buffer`) is decompressed but still encoded. A page is
+    self-contained: it stays valid after the iterator that produced it is
+    exhausted or the file is closed.
+    """
+
+    def __init__(self):
+        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor directly")
+
+    def __cinit__(self):
+        pass
+
+    def __repr__(self):
+        lines = [object.__repr__(self),
+                 f"  page_type: {self.page_type}",
+                 f"  encoding: {self.encoding}",
+                 f"  num_values: {self.num_values}"]
+        if self._type == ParquetPageType_DICTIONARY_PAGE:
+            lines.append(f"  is_sorted: {self.is_sorted}")
+        else:
+            lines.append(f"  uncompressed_size: {self.uncompressed_size}")
+            if self._type == ParquetPageType_DATA_PAGE:
+                lines.append(f"  definition_level_encoding: "
+                             f"{self.definition_level_encoding}")
+                lines.append(f"  repetition_level_encoding: "
+                             f"{self.repetition_level_encoding}")
+            else:
+                lines.append(f"  num_nulls: {self.num_nulls}")
+                lines.append(f"  num_rows: {self.num_rows}")
+                lines.append(f"  definition_levels_byte_length: "
+                             f"{self.definition_levels_byte_length}")
+                lines.append(f"  repetition_levels_byte_length: "
+                             f"{self.repetition_levels_byte_length}")
+                lines.append(f"  is_compressed: {self.is_compressed}")
+            lines.append("  statistics:")
+            lines.append(indent(repr(self.statistics), 4 * ' '))
+        return "\n".join(lines)
+
+    @property
+    def page_type(self):
+        """Page type (str): 'DICTIONARY_PAGE', 'DATA_PAGE' or 'DATA_PAGE_V2'."""
+        return page_type_name_from_enum(self._type)
+
+    @property
+    def encoding(self):
+        """Encoding of the page values (str), e.g. 'PLAIN' or 'RLE_DICTIONARY'."""
+        return encoding_name_from_enum(self._encoding)
+
+    @property
+    def num_values(self):
+        """
+        Number of values in the page (int).
+
+        For data pages this includes null values; for dictionary pages it is
+        the number of dictionary entries.
+        """
+        return self._num_values
+
+    @property
+    def buffer(self):
+        """
+        Page body as a :class:`pyarrow.Buffer`, decompressed but still encoded.
+
+        For data pages, this holds the repetition levels, definition levels
+        and encoded values; for dictionary pages, the encoded dictionary.
+        """
+        return pyarrow_wrap_buffer(self._buffer)
+
+    @property
+    def statistics(self):
+        """Page-level :class:`Statistics` (data pages only, None if absent)."""
+        cdef:
+            int64_t num_values
+            Statistics statistics
+
+        if self._encoded_statistics.get() == NULL:
+            return None
+        if self._statistics.get() == NULL:
+            # As for ColumnChunkMetaData.statistics, num_values counts
+            # the non-null values
+            if self._type == ParquetPageType_DATA_PAGE_V2:
+                num_values = self._num_values - self._num_nulls
+            elif self._encoded_statistics.get().has_null_count:
+                num_values = (self._num_values -
+                              self._encoded_statistics.get().null_count)
+            else:
+                num_values = self._num_values
+            self._statistics = CStatistics.Make(
+                self._descr, self._encoded_statistics.get(), num_values,
+                self._pool)
+        statistics = Statistics.__new__(Statistics)
+        # The Statistics object references the encoded min/max values
+        # owned by this page
+        statistics.init(self._statistics, self)
+        return statistics
+
+    @property
+    def uncompressed_size(self):
+        """Uncompressed size of the page body in bytes (int, data pages only)."""
+        if self._type == ParquetPageType_DICTIONARY_PAGE:
+            return None
+        return self._uncompressed_size
+
+    @property
+    def definition_level_encoding(self):
+        """Encoding of the definition levels (str, DATA_PAGE only)."""
+        if self._type != ParquetPageType_DATA_PAGE:
+            return None
+        return encoding_name_from_enum(self._definition_level_encoding)
+
+    @property
+    def repetition_level_encoding(self):
+        """Encoding of the repetition levels (str, DATA_PAGE only)."""
+        if self._type != ParquetPageType_DATA_PAGE:
+            return None
+        return encoding_name_from_enum(self._repetition_level_encoding)
+
+    @property
+    def num_nulls(self):
+        """Number of null values in the page (int, DATA_PAGE_V2 only)."""
+        if self._type != ParquetPageType_DATA_PAGE_V2:
+            return None
+        return self._num_nulls
+
+    @property
+    def num_rows(self):
+        """Number of rows in the page (int, DATA_PAGE_V2 only)."""
+        if self._type != ParquetPageType_DATA_PAGE_V2:
+            return None
+        return self._num_rows
+
+    @property
+    def definition_levels_byte_length(self):
+        """Byte length of the definition levels (int, DATA_PAGE_V2 only)."""
+        if self._type != ParquetPageType_DATA_PAGE_V2:
+            return None
+        return self._definition_levels_byte_length
+
+    @property
+    def repetition_levels_byte_length(self):
+        """Byte length of the repetition levels (int, DATA_PAGE_V2 only)."""
+        if self._type != ParquetPageType_DATA_PAGE_V2:
+            return None
+        return self._repetition_levels_byte_length
+
+    @property
+    def is_compressed(self):
+        """Whether the values were stored compressed (bool, DATA_PAGE_V2 only)."""
+        if self._type != ParquetPageType_DATA_PAGE_V2:
+            return None
+        return self._is_compressed
+
+    @property
+    def is_sorted(self):
+        """Whether the dictionary is sorted (bool, DICTIONARY_PAGE only)."""
+        if self._type != ParquetPageType_DICTIONARY_PAGE:
+            return None
+        return self._is_sorted
+
+
+cdef ParquetPage _wrap_page(const shared_ptr[CPage]& c_page,
+                            const ColumnDescriptor* descr,
+                            FileMetaData file_metadata,
+                            CMemoryPool* pool):
+    cdef:
+        ParquetPage page = ParquetPage.__new__(ParquetPage)
+        CPage* raw_page = c_page.get()
+        CDataPage* data_page
+        CDataPageV1* data_page_v1
+        CDataPageV2* data_page_v2
+        CDictionaryPage* dictionary_page
+        shared_ptr[CBuffer] c_buffer = raw_page.buffer()
+        CResult[shared_ptr[CBuffer]] copy_result
+
+    # The PageReader reuses its decompression buffer across NextPage() calls
+    # (and otherwise hands out slices of the whole column chunk), so copy the
+    # page body to make the ParquetPage independent of the reader.
+    with nogil:
+        copy_result = c_buffer.get().CopySlice(0, c_buffer.get().size(), pool)
+    page._buffer = GetResultValue(copy_result)
+    page._pool = pool
+    page._descr = descr
+    page._file_metadata = file_metadata
+
+    page._type = raw_page.type()
+    if page._type == ParquetPageType_DICTIONARY_PAGE:
+        dictionary_page = <CDictionaryPage*> raw_page
+        page._encoding = dictionary_page.encoding()
+        page._num_values = dictionary_page.num_values()
+        page._is_sorted = dictionary_page.is_sorted()
+        return page
+
+    data_page = <CDataPage*> raw_page
+    page._encoding = data_page.encoding()
+    page._num_values = data_page.num_values()
+    page._uncompressed_size = data_page.uncompressed_size()
+    if page._type == ParquetPageType_DATA_PAGE:
+        data_page_v1 = <CDataPageV1*> raw_page
+        page._definition_level_encoding = data_page_v1.definition_level_encoding()
+        page._repetition_level_encoding = data_page_v1.repetition_level_encoding()
+    else:
+        data_page_v2 = <CDataPageV2*> raw_page
+        page._num_nulls = data_page_v2.num_nulls()
+        page._num_rows = data_page_v2.num_rows()
+        page._definition_levels_byte_length = (
+            data_page_v2.definition_levels_byte_length())
+        page._repetition_levels_byte_length = (
+            data_page_v2.repetition_levels_byte_length())
+        page._is_compressed = data_page_v2.is_compressed()
+
+    # As for ColumnChunkMetaData.statistics, ignore statistics that are
+    # known to be incorrect given the writer version (e.g. PARQUET-251)
+    if (data_page.statistics().is_set() and
+            descr.sort_order() != ParquetSortOrder_UNKNOWN and
+            file_metadata._metadata.writer_version().HasCorrectStatistics(
+                descr.physical_type(), data_page.statistics(),
+                descr.sort_order())):
+        page._encoded_statistics = make_shared[CEncodedStatistics](
+            data_page.statistics())
+    return page
 
 
 cdef class ParquetReader(_Weakrefable):
@@ -1966,6 +2202,58 @@ cdef class ParquetReader(_Weakrefable):
             check_status(self.reader.get()
                          .ReadColumn(column_index, &out))
         return pyarrow_wrap_chunked_array(out)
+
+    def iter_pages(self, int row_group, int column):
+        """
+        Iterate over the pages of a single column chunk.
+
+        Parameters
+        ----------
+        row_group : int
+            Index of the row group.
+        column : int
+            Index of the leaf column within the row group, as in
+            RowGroupMetaData.column.
+
+        Returns
+        -------
+        iterator of ParquetPage
+        """
+        cdef:
+            FileMetaData file_metadata = self.metadata
+            int num_row_groups = file_metadata.num_row_groups
+            int num_columns = file_metadata.num_columns
+
+        if row_group < 0 or row_group >= num_row_groups:
+            raise IndexError(
+                f"Row group index {row_group} out of bounds "
+                f"(file has {num_row_groups} row groups)")
+        if column < 0 or column >= num_columns:
+            raise IndexError(
+                f"Column index {column} out of bounds "
+                f"(file has {num_columns} leaf columns)")
+        return self._iter_pages(row_group, column)
+
+    def _iter_pages(self, int row_group, int column):
+        cdef:
+            FileMetaData file_metadata = self.metadata
+            ParquetFileReader* file_reader = self.reader.get().parquet_reader()
+            const ColumnDescriptor* descr = (
+                file_metadata._metadata.schema().Column(column))
+            shared_ptr[CRowGroupReader] row_group_reader
+            UniquePtrNoGIL[CPageReader] page_reader
+            shared_ptr[CPage] page
+
+        with nogil:
+            row_group_reader = file_reader.RowGroup(row_group)
+            page_reader = row_group_reader.get().GetColumnPageReader(column)
+
+        while True:
+            with nogil:
+                page = page_reader.get().NextPage()
+            if page.get() == NULL:
+                break
+            yield _wrap_page(page, descr, file_metadata, self.pool)
 
     def close(self):
         if not self.closed:
